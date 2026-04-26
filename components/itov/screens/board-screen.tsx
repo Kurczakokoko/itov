@@ -201,20 +201,37 @@ function SelectionPhase({
     (p) => pending[p.id]?.move && pending[p.id]?.direction,
   ).length
 
+  // Build the selections payload. Partial assignments are normalized
+  // (rather than dropped), so anything the player started picking still
+  // produces a meaningful move:
+  //   - move + direction → use as-is.
+  //   - direction only   → hold facing that direction (lock the facing).
+  //   - move only        → omitted; the server's engine defaults missing
+  //                        entries to `hold @ piece.facing` already, which
+  //                        is the desired "hold in place" fallback.
+  //   - nothing          → omitted (same fallback as above).
   const handleConfirm = useCallback(() => {
     const sel: Selections = {}
     for (const p of ownAlivePieces) {
       const a = pending[p.id]
-      if (!a?.move || !a?.direction) continue
-      sel[p.id] = {
-        pieceId: p.id,
-        move: a.move,
-        direction: uiToAbsoluteDirection(role, a.direction),
+      if (a?.move && a?.direction) {
+        sel[p.id] = {
+          pieceId: p.id,
+          move: a.move,
+          direction: uiToAbsoluteDirection(role, a.direction),
+        }
+      } else if (a?.direction && !a?.move) {
+        sel[p.id] = {
+          pieceId: p.id,
+          move: "hold",
+          direction: uiToAbsoluteDirection(role, a.direction),
+        }
       }
     }
     console.log("[v0][itov] handleConfirm submit", {
       role,
       pieceCount: Object.keys(sel).length,
+      total: ownAlivePieces.length,
     })
     onSubmit(sel)
   }, [ownAlivePieces, pending, role, onSubmit])
