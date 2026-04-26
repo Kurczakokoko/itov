@@ -41,16 +41,16 @@ const COLOR_FILL_OPP: Record<Piece["color"], string> = {
 }
 
 // The indicator span natively extends DOWN from a top-center origin. CSS
-// `rotate(Xdeg)` rotates clockwise in screen coords (where +y is down). So:
+// `rotate(Xdeg)` rotates clockwise as seen on screen. Starting from "down":
 //   0°   → south (down)
-//   90°  → east  (right)
+//   90°  → west  (left)   — 6 o'clock rotates CW to 9 o'clock
 //   180° → north (up)
-//   270° → west  (left)
+//   270° → east  (right)  — 6 o'clock rotates CW to 3 o'clock
 const ROT_DEG: Record<Direction, number> = {
   down: 0,
-  right: 90,
+  left: 90,
   up: 180,
-  left: 270,
+  right: 270,
 }
 
 export function PieceToken({
