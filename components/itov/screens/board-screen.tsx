@@ -11,6 +11,7 @@ import {
 } from "@/components/itov/board/selection-controls"
 import {
   absoluteToUiDirection,
+  toScreenCoord,
   uiToAbsoluteDirection,
 } from "@/components/itov/board/coords"
 import { useGame } from "@/lib/itov/store"
@@ -110,8 +111,21 @@ function SelectionPhase({
   opponentSubmitted,
   existingSelections,
 }: SelectionPhaseProps) {
+  // Sort own pieces left-to-right as they appear on this viewer's screen.
+  // For player B (joiner) the board is rotated 180°, so absolute-X-ascending
+  // would walk right-to-left on screen. Sorting by screen-X keeps the
+  // initial selection and auto-advance flow visually left-to-right for both
+  // host and joiner.
   const ownAlivePieces = useMemo(
-    () => pieces.filter((p) => p.owner === role && p.alive),
+    () =>
+      pieces
+        .filter((p) => p.owner === role && p.alive)
+        .slice()
+        .sort(
+          (a, b) =>
+            toScreenCoord(role, a.x, a.y).sx -
+            toScreenCoord(role, b.x, b.y).sx,
+        ),
     [pieces, role],
   )
 

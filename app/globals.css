@@ -130,15 +130,11 @@
     color: var(--foreground);
   }
   body {
-    /* Subtle textured background — paper grain + faint dot grid.
-       Layered so the effect is felt, not seen. */
+    /* Soft ambient lighting only — no repeating dot grid (would otherwise
+       become visible in screens with lots of open space, like the round
+       screen, and read inconsistent vs. denser screens). */
     background-color: var(--background);
     background-image:
-      radial-gradient(
-        circle at 50% 50%,
-        rgba(238, 226, 205, 0.025) 0.5px,
-        transparent 1px
-      ),
       radial-gradient(
         ellipse at 30% 20%,
         rgba(238, 226, 205, 0.015),
@@ -149,10 +145,6 @@
         rgba(0, 0, 0, 0.25),
         transparent 60%
       );
-    background-size:
-      24px 24px,
-      auto,
-      auto;
   }
 }
 
@@ -168,22 +160,10 @@
     text-wrap: pretty;
   }
 
-  /* Subtle ritual grain overlay used on screens */
+  /* Kept as a positioning anchor for descendants. The previous fine-grain
+     dot overlay was removed so all screens share a clean, unified surface. */
   .ritual-grain {
     position: relative;
-  }
-  .ritual-grain::before {
-    content: '';
-    position: absolute;
-    inset: 0;
-    pointer-events: none;
-    background-image: radial-gradient(
-      rgba(238, 226, 205, 0.04) 1px,
-      transparent 1px
-    );
-    background-size: 3px 3px;
-    mix-blend-mode: overlay;
-    opacity: 0.6;
   }
 
   @keyframes itov-fade-in {
