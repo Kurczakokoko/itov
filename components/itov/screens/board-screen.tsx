@@ -117,15 +117,29 @@ function SelectionPhase({
   // initial selection and auto-advance flow visually left-to-right for both
   // host and joiner.
   const ownAlivePieces = useMemo(
-    () =>
-      pieces
+    () => {
+      const sorted = pieces
         .filter((p) => p.owner === role && p.alive)
         .slice()
         .sort(
           (a, b) =>
             toScreenCoord(role, a.x, a.y).sx -
             toScreenCoord(role, b.x, b.y).sx,
-        ),
+        )
+      console.log(
+        "[v0][itov][board] ownAlivePieces sorted",
+        JSON.stringify({
+          role,
+          order: sorted.map((p) => ({
+            id: p.id,
+            color: p.color,
+            absX: p.x,
+            screenX: toScreenCoord(role, p.x, p.y).sx,
+          })),
+        }),
+      )
+      return sorted
+    },
     [pieces, role],
   )
 
