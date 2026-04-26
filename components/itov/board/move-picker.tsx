@@ -80,10 +80,7 @@ export function MovePicker({
             dir="left"
             label="←"
             active={direction === "left"}
-            onClick={() => {
-              console.log("[v0][itov][picker] click ← button -> onSelectDirection(left)")
-              onSelectDirection("left")
-            }}
+            onClick={() => onSelectDirection("left")}
           />
           <div className="border-foreground-faint flex size-12 items-center justify-center rounded-full border border-dashed">
             <span className="bg-foreground-faint size-1 rounded-full" />
@@ -92,10 +89,7 @@ export function MovePicker({
             dir="right"
             label="→"
             active={direction === "right"}
-            onClick={() => {
-              console.log("[v0][itov][picker] click → button -> onSelectDirection(right)")
-              onSelectDirection("right")
-            }}
+            onClick={() => onSelectDirection("right")}
           />
           <span />
           <DirButton

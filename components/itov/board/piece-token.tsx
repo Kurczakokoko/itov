@@ -97,20 +97,6 @@ export function PieceToken({
   const showIndicator = queuedMove != null && indicatorDir != null
   const indicatorHeight = extension + Math.round(size * 0.18)
 
-  if (showIndicator && indicatorDir) {
-    console.log(
-      "[v0][itov][piece-token] render indicator",
-      JSON.stringify({
-        pieceId: piece.id,
-        owner: piece.owner,
-        viewerRole,
-        move: queuedMove?.move,
-        directionPassedIn: indicatorDir,
-        rotateDeg: ROT_DEG[indicatorDir],
-      }),
-    )
-  }
-
   const Comp: React.ElementType = onClick ? "button" : "div"
 
   return (
