@@ -14,9 +14,17 @@ export async function GET(req: Request) {
       { status: 400 },
     )
   }
-  const state = getPublicState(code, clientId)
-  if (!state) {
-    return NextResponse.json({ error: "Room not found" }, { status: 404 })
+  try {
+    const state = await getPublicState(code, clientId)
+    if (!state) {
+      return NextResponse.json({ error: "Room not found" }, { status: 404 })
+    }
+    return NextResponse.json(state)
+  } catch (err) {
+    console.error("[v0][itov] state error", err)
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : "Server error" },
+      { status: 500 },
+    )
   }
-  return NextResponse.json(state)
 }

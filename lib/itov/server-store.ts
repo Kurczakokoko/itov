@@ -1,13 +1,14 @@
 // Server-side authoritative state for ITOV matches.
 //
-// Rooms live in process memory keyed by a 5-character code, persisted across
-// HMR via `globalThis.__itovRoomsV3`. In a production deploy you would back
-// this with Redis/Supabase; for a single-instance demo it is sufficient.
+// Room state lives in Upstash Redis (see ./redis.ts). Each room is stored
+// as a single JSON value keyed by code; mutations are serialized via a
+// per-room distributed lock so that simultaneous submits / acks from both
+// players resolve correctly.
 //
 // IMPORTANT design property: `leaveRoom` does NOT immediately drop the room.
 // It marks `endedAt` so clients can show a graceful "match ended" overlay
-// for a short grace window. After the window, the room is purged. This
-// prevents accidental Leave taps from silently 404'ing both peers' polling.
+// for a short grace window. After the window, the room's TTL lapses or it
+// is treated as not-found.
 
 import {
   isRoundOver,
@@ -15,6 +16,14 @@ import {
   resolveExchange,
 } from "./engine"
 import { MATCH_TARGET, SELECTION_TIMER_SECONDS } from "./constants"
+import {
+  hostIndexKey,
+  readRoom,
+  redis,
+  ROOM_TTL_SECONDS,
+  withRoomLock,
+  writeRoom,
+} from "./redis"
 import type {
   ExchangeResult,
   Piece,
@@ -77,49 +86,15 @@ export interface Room {
   version: number
 }
 
-// ---------- Global registry (HMR safe) ----------
+// ---------- Constants ----------
 
-const ROOM_TTL_MS = 60 * 60 * 1000 // 1h hard cap
-const ENDED_GRACE_MS = 30 * 1000 // 30s after ended -> purge
-
-interface GlobalCache {
-  rooms: Map<string, Room>
-  /** Last sweep time; we sweep at most once a second on read. */
-  lastSweep: number
-}
-
-const g = globalThis as unknown as { __itovRoomsV3?: GlobalCache }
-if (!g.__itovRoomsV3) {
-  g.__itovRoomsV3 = { rooms: new Map(), lastSweep: 0 }
-  console.log("[v0][itov] server-store: initialized fresh global cache")
-} else {
-  console.log("[v0][itov] server-store: reusing existing global cache", {
-    roomCount: g.__itovRoomsV3.rooms.size,
-  })
-}
-const cache: GlobalCache = g.__itovRoomsV3
-
-function sweep() {
-  const now = Date.now()
-  if (now - cache.lastSweep < 1000) return
-  cache.lastSweep = now
-  for (const [code, room] of cache.rooms) {
-    if (room.endedAt && now - room.endedAt > ENDED_GRACE_MS) {
-      cache.rooms.delete(code)
-      console.log("[v0][itov] sweep: purged ended room", { code })
-      continue
-    }
-    if (now - room.updatedAt > ROOM_TTL_MS) {
-      cache.rooms.delete(code)
-      console.log("[v0][itov] sweep: purged stale room", { code })
-    }
-  }
-}
+const ENDED_GRACE_MS = 30 * 1000 // 30s after ended -> treat as gone
 
 // ---------- Helpers ----------
 
 const ROOM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-function generateRoomCode(): string {
+
+async function generateRoomCode(): Promise<string> {
   for (let attempt = 0; attempt < 25; attempt++) {
     let s = ""
     for (let i = 0; i < 5; i++) {
@@ -127,8 +102,10 @@ function generateRoomCode(): string {
         Math.floor(Math.random() * ROOM_CODE_ALPHABET.length)
       ]
     }
-    if (!cache.rooms.has(s)) return s
+    const exists = await readRoom(s)
+    if (!exists) return s
   }
+  // Fallback to a longer code; collision odds are astronomical.
   let s = ""
   for (let i = 0; i < 6; i++) {
     s += ROOM_CODE_ALPHABET[
@@ -189,23 +166,38 @@ function roleOf(room: Room, clientId: string): PlayerId | null {
   return null
 }
 
+/**
+ * Treat a room as gone if its end-grace window has elapsed. Callers that
+ * receive `null` from here should respond with a 404 / "room not found",
+ * mirroring the previous in-memory behavior.
+ */
+function isExpired(room: Room): boolean {
+  return !!room.endedAt && Date.now() - room.endedAt > ENDED_GRACE_MS
+}
+
 // ---------- Public API: actions ----------
 
-export function createRoom(hostClientId: string): Room {
-  sweep()
-  // If this client already hosts an active (not-ended) room, return it
-  // instead of creating a new one. Prevents a stray double-host click from
-  // orphaning the existing room.
-  for (const room of cache.rooms.values()) {
-    if (room.hostClientId === hostClientId && !room.endedAt) {
+export async function createRoom(hostClientId: string): Promise<Room> {
+  // If this client recently hosted, return the existing active room
+  // instead of creating a duplicate. This prevents stray double-host
+  // clicks from orphaning rooms.
+  const existingCode = (await redis.get(hostIndexKey(hostClientId))) as
+    | string
+    | null
+  if (existingCode) {
+    const existing = await readRoom(existingCode)
+    if (existing && !existing.endedAt) {
       console.log("[v0][itov] createRoom: reusing existing room", {
-        code: room.code,
+        code: existing.code,
       })
-      return touch(room)
+      // Refresh timestamps so the room's TTL extends.
+      const refreshed = touch(existing)
+      await writeRoom(refreshed)
+      return refreshed
     }
   }
 
-  const code = generateRoomCode()
+  const code = await generateRoomCode()
   const now = Date.now()
   const room: Room = {
     code,
@@ -219,188 +211,226 @@ export function createRoom(hostClientId: string): Room {
     endedBy: null,
     version: 1,
   }
-  cache.rooms.set(code, room)
-  console.log("[v0][itov] createRoom", {
-    code,
-    hostClientId,
-    totalRooms: cache.rooms.size,
+  await writeRoom(room)
+  await redis.set(hostIndexKey(hostClientId), code, {
+    ex: ROOM_TTL_SECONDS,
   })
+  console.log("[v0][itov] createRoom", { code, hostClientId })
   return room
 }
 
-export function joinRoom(
+export async function joinRoom(
   code: string,
   joinerClientId: string,
-):
-  | { ok: true; room: Room; role: PlayerId }
-  | { ok: false; error: string } {
-  sweep()
-  const room = cache.rooms.get(norm(code))
-  if (!room) {
-    console.log("[v0][itov] joinRoom: room not found", { code: norm(code) })
-    return { ok: false, error: "Room not found" }
-  }
-  if (room.endedAt) {
-    return { ok: false, error: "Match has ended" }
-  }
-  // Same client rejoining (e.g., reload) is always allowed.
-  if (room.joinerClientId === joinerClientId) {
-    room.joinerReady = true
-    touch(room)
-    return { ok: true, room, role: "B" }
-  }
-  if (room.hostClientId === joinerClientId) {
-    return {
-      ok: false,
-      error: "You're hosting this room — open a second tab to join",
+): Promise<
+  { ok: true; room: Room; role: PlayerId } | { ok: false; error: string }
+> {
+  return withRoomLock(norm(code), (room) => {
+    if (!room || isExpired(room)) {
+      console.log("[v0][itov] joinRoom: room not found", { code: norm(code) })
+      return { value: { ok: false, error: "Room not found" } as const }
     }
-  }
-  if (room.phase !== "lobby") {
-    return { ok: false, error: "Match already in progress" }
-  }
-  if (room.joinerClientId && room.joinerClientId !== joinerClientId) {
-    return { ok: false, error: "Room is full" }
-  }
-  room.joinerClientId = joinerClientId
-  room.joinerReady = true // auto-ready on join
-  touch(room)
-  console.log("[v0][itov] joinRoom (auto-ready)", {
-    code: room.code,
-    joinerClientId,
+    if (room.endedAt) {
+      return { value: { ok: false, error: "Match has ended" } as const }
+    }
+    // Same client rejoining (e.g., reload) is always allowed.
+    if (room.joinerClientId === joinerClientId) {
+      room.joinerReady = true
+      return {
+        value: { ok: true, room, role: "B" } as const,
+        save: touch(room),
+      }
+    }
+    if (room.hostClientId === joinerClientId) {
+      return {
+        value: {
+          ok: false,
+          error: "You're hosting this room — open a second tab to join",
+        } as const,
+      }
+    }
+    if (room.phase !== "lobby") {
+      return {
+        value: { ok: false, error: "Match already in progress" } as const,
+      }
+    }
+    if (room.joinerClientId && room.joinerClientId !== joinerClientId) {
+      return { value: { ok: false, error: "Room is full" } as const }
+    }
+    room.joinerClientId = joinerClientId
+    room.joinerReady = true // auto-ready on join
+    console.log("[v0][itov] joinRoom (auto-ready)", {
+      code: room.code,
+      joinerClientId,
+    })
+    return {
+      value: { ok: true, room, role: "B" } as const,
+      save: touch(room),
+    }
   })
-  return { ok: true, room, role: "B" }
 }
 
 /**
  * Mark the room as ended (NOT destroyed). Both clients will keep being able
  * to read state for ENDED_GRACE_MS so they can render a graceful overlay.
  */
-export function leaveRoom(code: string, clientId: string): void {
-  const room = cache.rooms.get(norm(code))
-  if (!room) return
-  const role = roleOf(room, clientId)
-  if (!role) return
-  if (room.endedAt) return // already ended
-  room.endedAt = Date.now()
-  room.endedBy = role
-  touch(room)
-  console.log("[v0][itov] leaveRoom -> ended", {
-    code: room.code,
-    by: role,
+export async function leaveRoom(
+  code: string,
+  clientId: string,
+): Promise<void> {
+  await withRoomLock(norm(code), (room) => {
+    if (!room) return { value: undefined }
+    const role = roleOf(room, clientId)
+    if (!role) return { value: undefined }
+    if (room.endedAt) return { value: undefined } // already ended
+    room.endedAt = Date.now()
+    room.endedBy = role
+    console.log("[v0][itov] leaveRoom -> ended", {
+      code: room.code,
+      by: role,
+    })
+    return { value: undefined, save: touch(room) }
   })
 }
 
 /** Legacy ready endpoint — auto-ready makes this a no-op success. */
-export function setJoinerReady(
+export async function setJoinerReady(
   code: string,
   clientId: string,
-): Room | null {
-  const room = cache.rooms.get(norm(code))
-  if (!room || room.endedAt) return null
-  if (clientId !== room.joinerClientId) return null
-  room.joinerReady = true
-  return touch(room)
+): Promise<Room | null> {
+  return withRoomLock(norm(code), (room) => {
+    if (!room || room.endedAt) return { value: null }
+    if (clientId !== room.joinerClientId) return { value: null }
+    room.joinerReady = true
+    const next = touch(room)
+    return { value: next, save: next }
+  })
 }
 
-export function startMatch(
+export async function startMatch(
   code: string,
   clientId: string,
-): { ok: true; room: Room } | { ok: false; error: string } {
-  const room = cache.rooms.get(norm(code))
-  if (!room) return { ok: false, error: "Room not found" }
-  if (room.endedAt) return { ok: false, error: "Match has ended" }
-  if (clientId !== room.hostClientId) {
-    return { ok: false, error: "Only host can start" }
-  }
-  if (!room.joinerClientId) {
-    return { ok: false, error: "Waiting for opponent" }
-  }
-  if (room.phase !== "lobby") {
-    // Idempotent: already started, just return current state.
-    return { ok: true, room }
-  }
-  Object.assign(room, freshMatchState())
-  room.phase = "selecting"
-  room.selectingStartedAt = Date.now()
-  console.log("[v0][itov] startMatch", { code: room.code })
-  return { ok: true, room: touch(room) }
+): Promise<{ ok: true; room: Room } | { ok: false; error: string }> {
+  return withRoomLock(norm(code), (room) => {
+    if (!room || isExpired(room)) {
+      return { value: { ok: false, error: "Room not found" } as const }
+    }
+    if (room.endedAt) {
+      return { value: { ok: false, error: "Match has ended" } as const }
+    }
+    if (clientId !== room.hostClientId) {
+      return { value: { ok: false, error: "Only host can start" } as const }
+    }
+    if (!room.joinerClientId) {
+      return { value: { ok: false, error: "Waiting for opponent" } as const }
+    }
+    if (room.phase !== "lobby") {
+      // Idempotent: already started, just return current state.
+      return { value: { ok: true, room } as const }
+    }
+    Object.assign(room, freshMatchState())
+    room.phase = "selecting"
+    room.selectingStartedAt = Date.now()
+    const next = touch(room)
+    console.log("[v0][itov] startMatch", { code: room.code })
+    return { value: { ok: true, room: next } as const, save: next }
+  })
 }
 
-export function submitSelections(
+export async function submitSelections(
   code: string,
   clientId: string,
   selections: Selections,
-):
-  | { ok: true; room: Room }
-  | { ok: false; error: string } {
-  const room = cache.rooms.get(norm(code))
-  if (!room) return { ok: false, error: "Room not found" }
-  if (room.endedAt) return { ok: false, error: "Match has ended" }
-  const role = roleOf(room, clientId)
-  if (!role) return { ok: false, error: "Not a player in this room" }
-  if (room.phase !== "selecting") {
-    // Late submit is a no-op success.
-    return { ok: true, room }
-  }
-  if (role === "A") room.selectionsA = selections
-  else room.selectionsB = selections
-  maybeResolve(room)
-  return { ok: true, room: touch(room) }
+): Promise<
+  { ok: true; room: Room } | { ok: false; error: string }
+> {
+  return withRoomLock(norm(code), (room) => {
+    if (!room || isExpired(room)) {
+      return { value: { ok: false, error: "Room not found" } as const }
+    }
+    if (room.endedAt) {
+      return { value: { ok: false, error: "Match has ended" } as const }
+    }
+    const role = roleOf(room, clientId)
+    if (!role) {
+      return {
+        value: { ok: false, error: "Not a player in this room" } as const,
+      }
+    }
+    if (room.phase !== "selecting") {
+      // Late submit is a no-op success.
+      return { value: { ok: true, room } as const }
+    }
+    if (role === "A") room.selectionsA = selections
+    else room.selectionsB = selections
+    maybeResolve(room)
+    const next = touch(room)
+    return { value: { ok: true, room: next } as const, save: next }
+  })
 }
 
-export function ackResolution(
+export async function ackResolution(
   code: string,
   clientId: string,
-): Room | null {
-  const room = cache.rooms.get(norm(code))
-  if (!room || room.endedAt) return null
-  const role = roleOf(room, clientId)
-  if (!role) return null
-  if (room.phase !== "revealing") return room
-  if (role === "A") room.ackA = true
-  else room.ackB = true
-  if (room.ackA && room.ackB) advanceFromReveal(room)
-  return touch(room)
+): Promise<Room | null> {
+  return withRoomLock(norm(code), (room) => {
+    if (!room || room.endedAt) return { value: null }
+    const role = roleOf(room, clientId)
+    if (!role) return { value: null }
+    if (room.phase !== "revealing") return { value: room }
+    if (role === "A") room.ackA = true
+    else room.ackB = true
+    if (room.ackA && room.ackB) advanceFromReveal(room)
+    const next = touch(room)
+    return { value: next, save: next }
+  })
 }
 
-export function continueFromRound(
+export async function continueFromRound(
   code: string,
   clientId: string,
-): Room | null {
-  const room = cache.rooms.get(norm(code))
-  if (!room || room.endedAt) return null
-  const role = roleOf(room, clientId)
-  if (!role) return null
-  if (room.phase !== "round-end") return room
-  if (role === "A") room.ackA = true
-  else room.ackB = true
-  if (room.ackA && room.ackB) {
-    room.pieces = makeStartingPieces()
-    room.round += 1
-    room.selectionsA = null
-    room.selectionsB = null
-    room.pendingResolution = null
-    room.ackA = false
-    room.ackB = false
-    room.lastRoundWinner = null
-    room.phase = "selecting"
-    room.selectingStartedAt = Date.now()
-  }
-  return touch(room)
+): Promise<Room | null> {
+  return withRoomLock(norm(code), (room) => {
+    if (!room || room.endedAt) return { value: null }
+    const role = roleOf(room, clientId)
+    if (!role) return { value: null }
+    if (room.phase !== "round-end") return { value: room }
+    if (role === "A") room.ackA = true
+    else room.ackB = true
+    if (room.ackA && room.ackB) {
+      room.pieces = makeStartingPieces()
+      room.round += 1
+      room.selectionsA = null
+      room.selectionsB = null
+      room.pendingResolution = null
+      room.ackA = false
+      room.ackB = false
+      room.lastRoundWinner = null
+      room.phase = "selecting"
+      room.selectingStartedAt = Date.now()
+    }
+    const next = touch(room)
+    return { value: next, save: next }
+  })
 }
 
-export function rematch(code: string, clientId: string): Room | null {
-  const room = cache.rooms.get(norm(code))
-  if (!room || room.endedAt) return null
-  if (clientId !== room.hostClientId) return null
-  if (room.phase !== "match-end") return null
-  Object.assign(room, freshMatchState())
-  if (room.joinerClientId) room.joinerReady = true
-  return touch(room)
+export async function rematch(
+  code: string,
+  clientId: string,
+): Promise<Room | null> {
+  return withRoomLock(norm(code), (room) => {
+    if (!room || room.endedAt) return { value: null }
+    if (clientId !== room.hostClientId) return { value: null }
+    if (room.phase !== "match-end") return { value: null }
+    Object.assign(room, freshMatchState())
+    if (room.joinerClientId) room.joinerReady = true
+    const next = touch(room)
+    return { value: next, save: next }
+  })
 }
 
-/** Selection timer tick (called on every state read). */
-function tickRoom(room: Room): void {
+/** Selection timer tick — pure check + mutation. Only call under lock. */
+function tickRoom(room: Room): boolean {
   if (
     room.phase === "selecting" &&
     room.selectingStartedAt &&
@@ -410,7 +440,9 @@ function tickRoom(room: Room): void {
     if (!room.selectionsB) room.selectionsB = {}
     maybeResolve(room)
     touch(room)
+    return true
   }
+  return false
 }
 
 // ---------- Internal transitions ----------
@@ -520,17 +552,14 @@ export interface PublicRoomState {
   serverNow: number
 }
 
-export function getPublicState(
-  code: string,
+/**
+ * Pure projection: room -> client-visible state for `clientId`.
+ * Use this after a write action so we don't re-acquire the lock.
+ */
+export function roomToPublicState(
+  room: Room,
   clientId: string,
-): PublicRoomState | null {
-  sweep()
-  const room = cache.rooms.get(norm(code))
-  if (!room) return null
-
-  // Selection-timer tick (skipped if already ended).
-  if (!room.endedAt) tickRoom(room)
-
+): PublicRoomState {
   const role = roleOf(room, clientId)
   const showResolution = room.phase === "revealing"
 
@@ -590,4 +619,45 @@ export function getPublicState(
     version: room.version,
     serverNow: Date.now(),
   }
+}
+
+/**
+ * Read the room and project it for the given client.
+ *
+ * Fast path: most reads don't mutate, so we skip the lock and just GET.
+ * If the selection timer has lapsed we re-read under the lock to apply
+ * the auto-resolve transition atomically.
+ */
+export async function getPublicState(
+  code: string,
+  clientId: string,
+): Promise<PublicRoomState | null> {
+  const c = norm(code)
+  const room = await readRoom(c)
+  if (!room) return null
+  if (isExpired(room)) return null
+
+  // Fast path: no timer tick needed.
+  const needsTick =
+    !room.endedAt &&
+    room.phase === "selecting" &&
+    room.selectingStartedAt !== null &&
+    Date.now() - room.selectingStartedAt >=
+      SELECTION_TIMER_SECONDS * 1000
+
+  if (!needsTick) {
+    return roomToPublicState(room, clientId)
+  }
+
+  // Slow path: mutate under lock so timer expiry is applied exactly once.
+  return withRoomLock(c, (latest) => {
+    if (!latest || isExpired(latest)) {
+      return { value: null }
+    }
+    const ticked = tickRoom(latest)
+    return {
+      value: roomToPublicState(latest, clientId),
+      save: ticked ? latest : undefined,
+    }
+  })
 }
